@@ -1,0 +1,340 @@
+<?php
+
+/*
+
+Class to be used for displaying Access MDB files and converting them to MySQL database
+by Alekos Psimikakis, August 2017
+
+Methods:
+
+void mdb2db::init() - Initializes mdb2db
+void mdb2db::set_files(string $mdbfile, string $dbname="") - Set input and output pathfiles
+     Default MDB file extension is ".mdb".
+     If no '$dbname' is given, a DB will created usig the main filename of the MDB file
+     The processed or not DB name will be stored in mdb2db::dbname
+void mdb2db::set_connection($host, $user, $password) - Set MySQL connection data
+bool mdb2db::read_MDB() - Read the MDB file into memory
+     Returns 'true' if HTML file opening and reading are successful, otherwise 'false' and error message
+     in string mdb2db::errmess
+void mdb2db::convert() - Converts the MDB into MySQL DB
+     If an error occurs, an error message will be displayed and the PHP will terminate
+
+Note:
+1) This class does not handle too complex MDB files
+2) Records with binary data are not displayed/written (A mark "(bin)" is used instead)
+3) It might take some time to create a lot of tables and/or add a lot of records. This will be manifested
+   with the usual spinning wheel. Let the process finish! (Except if you have a reaon to stop the process,
+   e.g. You have not started Apache and/or MySQL server!
+
+***
+
+Example of use:
+
+$mdbfile = "r:\\w\\1.mdb"; $dbname = "z4";
+$host = "localhost"; $user = "root"; $pass = "";
+
+$display_only = false; // Set this to 'true' to just display the MDB
+
+$obj = new mdb();
+$obj->init();
+$obj->set_files($mdbfile, $dbname);
+
+if (!($res = $obj->read_MDB()))
+  echo "<p>* $ms *</p>";
+else if ($display_only)
+  $obj->display_MDB();
+else {
+  $obj->set_connection($host, $user, $pass);
+  $obj->convert();
+  echo "<p>* DB '".$obj->dbname."' created *</p>";
+}
+
+*/
+
+class mdb {
+  public $mdbfile, $dbname;
+  public $errmess;
+  public $tables, $total_tables;
+  public $total_fields, $field_names;
+  public $field_type_names, $field_DB_type_names;
+  //public $field_type_codes
+  public $field_lens;
+  public $total_recs, $ftrecs, $maxrecs;
+  public $host, $user, $pass;
+  public $db, $db_types;
+
+  function init() {
+    define("MAXRECS", 10); // Defeult max number of redords to display define
+    define("MAXRECLEN", 20); // Max length foe a redord to display
+    define("MDBEXT", ".mdb");
+    define("NL", "<br>");
+
+    $this->total_tables = 0; $this->tables = array();
+    $this->total_fields = array(); $field_names = array(); // Field names for each table
+    $this->field_type_names = array(); // Field types names for each table
+    $this->field_DB_type_names = array(); // Corresp. DB field type names
+    //$this->field_type_codes = array(); // Field types codes
+    $this->field_lens = array(); // Field lengths for each table
+    $this->total_recs = array(); // Total records for each table
+    $this->ftrecs = array(); // Records for each field for each table
+    $this->db_types = array();
+    $this->maxrecs = MAXRECS;
+    $this->errmess = "";
+
+    // The following array associates ODBC data types to MySQL DB data types
+    // Some MDB types that have no exact correspondence in DB remain as such and are then handled when creating
+    // a table with fields that contain them (key = DB, value = ODBC)
+    // Single quotations are used in order for GetDBname() to get whole-word matches in array search
+    // Re: https://docs.microsoft.com/en-us/sql/odbc/microsoft/microsoft-access-data-types
+    // Note: Don
+    // Don't use TIMESTAMP for DATETIME! It shows 0000-00-00!
+    $this->db_types = array(
+      "BINARY"=>"BINARY",
+      "BIT"=>"BIT",
+      "INT"=>"COUNTER",
+      "NUMERIC"=>"CURRENCY",
+      "DATETIME"=>"DATETIME",
+      "INTEGER"=>"INTEGER",
+      "LONGBLOB"=>"LONGBINARY",
+      "LONGTEXT"=>"LONGCHAR",
+      "REAL"=>"REAL",
+      "SMALLINT"=>"SMALLINT",
+      "VARCHAR"=>"VARCHAR");
+
+    set_time_limit(0); // Avoid timeout when creating recs
+
+  }
+
+  // Set MDB pathfile and DB name
+  function set_files($mdbf, $dbn = "") {
+    $this->mdbfile = $this->set_file($mdbf, MDBEXT);
+    if ($dbn == "") {
+      if (!($a = strrpos($this->mdbfile, "/"))) $a = 0;
+      $b = strrpos($this->mdbfile, ","); $this->dbname = substr($this->mdbfile, $a, $b-$a);
+    } else $this->dbname = $dbn;
+  }
+
+  // Set MySQL connection data
+  function set_connection($host, $user, $password) {
+    $this->host = $host; $this->user = $user; $this->pass = $password;
+  }
+
+  // Read the MDB data and create totals and arrays
+  // The function returns 'true'/'false' according to successful/failed connection
+  // In case of error, public 'errmess' will contain the error message
+  function read_MDB() {
+    $conn = @odbc_connect("Driver={Microsoft Access Driver (*.mdb)};Dbq=$this->mdbfile", '', '');
+    if (!$conn) {$this->errmess = "ODBC failed to open '$mdbfile'"; return false;}
+
+    // Part I - Collect description info for each table and field
+    if (!($res = odbc_tables($conn))) {
+      $this->errmess = "Failed to get list of MDB tables"; return false;
+    }
+    $type ="TABLE";
+    while (odbc_fetch_row($res)) {
+      if (!($s = odbc_result($res, "TABLE_TYPE"))) {
+        $this->errmess = "Failed to get result data"; return false;
+      }
+      // Save results into an array
+      if ($s == $type) array_push($this->tables, odbc_result($res, "TABLE_NAME"));
+    }
+    $ary = array(); $this->total_tables = sizeof($this->tables);
+    for ($t = 0; $t < $this->total_tables; $t++) {
+      if (!($res = odbc_columns($conn, null, null, $this->tables[$t]))) {
+        $this->errmess = "Failed to get a list of column names"; return false;
+      }
+      // Get field data
+      $f = 0;
+      while (odbc_fetch_into($res, $ary)) {
+        $this->field_names[$t][$f] = $ary[3]; // Store field name
+        //$this->field_type_codes[$t][$f] = $ary[4]; // Store field type codes
+        $this->field_type_names[$t][$f] = $ary[5]; // Store field type name
+        $this->field_DB_type_names[$t][$f] = $this->GetDBname($ary[5]); // Get and store corresp. DB name
+        $this->field_lens[$t][$f] = $ary[6]; // Store field type lengths (for creating DB only)
+
+        ++$f;
+      }
+      $this->total_fields[$t] = $f; // Store total fields for this table
+    }
+
+    // Part 2 - Collect records data for each table and field
+    for ($t = 0; $t < $this->total_tables; $t++) {
+      $table = $this->tables[$t];
+      // Get the number of total recs(rows)
+      $sql = "SELECT Count(*) FROM `$table`";
+      if (!($res = odbc_exec($conn, $sql))) {
+        $this->errmess = "Failed to get total records"; return false;
+      }
+      odbc_fetch_row($res); $this->total_recs[$t] = odbc_result($res,1); // Store total recs for this table
+      // Get all the recs of each field of the table
+      $sql = "SELECT * FROM `$table`";
+      $res = odbc_exec($conn, $sql);
+      for ($f = 0; $f < $this->total_fields[$t]; $f++) {
+        // Rewind! (Otherwise the 2nd and all the other fields will show 0 recs!)
+        odbc_fetch_row($res,0);
+        for ($r = 0; $r < $this->total_recs[$t]; $r++) {
+          odbc_fetch_row($res);
+          $this->ftrecs[$t][$f][$r] = odbc_result($res, $this->field_names[$t][$f]);
+    } } }
+    odbc_close($conn); $res = null; // Done - Close the connection
+    return true;
+  }
+
+  // Display the MDB data in a nice way
+  function display_MDB() {
+    $table_style = "border='1' cellpadding='2' style='border: solid 2px; border-collapse:collapse'";
+    $st1 = "<font size='-1'><i>"; $st2 = "</i></font>";
+   
+    echo "File: <b>$this->mdbfile</b>".NL;
+    echo "Total tables: $this->total_tables".NL.NL;
+   
+    for ($t = 0; $t < $this->total_tables; $t++) {
+      $table = $this->tables[$t]; $flds = $this->total_fields[$t]; $recs = $this->total_recs[$t];
+      $s1 = ($flds == 1) ? "" : "s"; $s2 = ($recs == 1) ? "" : "s";
+      $s = "Table #".($t+1).", <b>$table</b>: $flds field$s1, $recs record$s2".NL;
+      // Even if the table has no records display at least it;s fields and their data types
+      $s .= "<table $table_style>\n<tr>\n";
+      for ($f = 0; $f < $flds; $f++) {
+        $s .= "<td align='middle'><b>".$this->field_names[$t][$f]."</b><br>"
+              .$this->field_type_names[$t][$f].$st2."</td>\n";
+      }
+      echo $s."</tr>\n";
+      if ($recs != 0) {
+        if ($recs > $this->maxrecs) $recs = $this->maxrecs;
+        for ($r = 0; $r < $recs; $r++) {
+          $s = "<tr>\n";
+          for ($f = 0; $f < $flds; $f++) {
+            if (strpos(strtoupper($this->field_type_names[$t][$f]),"BINARY") !== false)
+              $s .= "<td align='middle'>(bin)</td>\n"; // Avoid displaying binary data
+            else {
+              $s2 = $this->ftrecs[$t][$f][$r];
+              if (strlen($s2) > MAXRECLEN) $s2 = substr($s2,0,MAXRECLEN)."...";
+              if (strtoupper(substr($this->field_names[$t][$f],strlen($this->field_names[$t][$f])-2,2)) ==
+                "ID")
+                $s .= "<td align='middle'>$s2</td>\n";
+              else
+                $s .= "<td>$s2</td>\n";
+          } }
+          echo $s."</tr>\n";
+        }
+        if (($recs != 0) && ($recs < $this->total_recs[$t]))
+          echo "<tr><td colspan=$flds align='middle'>".$st1."(More ...)".$st2."</td></tr>\n";
+      }
+      echo "</table>\n".NL;
+    }
+  }
+
+  // Do the conversion
+  // In case of any error, the class displays appropriate message and the PHP terminates
+  function convert() {
+
+    $this->db = mysqli_connect($this->host, $this->user, $this->pass);
+    if (!$this->db) {echo "Cannot connect to MySQL".NL; exit;}
+
+    // Step 1: Create DB
+    //if (!($res = $this->query("DROP DATABASE $this->dbname"))) $this->Quit();
+    if (!($res = $this->query("CREATE DATABASE IF NOT EXISTS $this->dbname"))) $this->Quit();
+
+    if (!($res = $this->query("USE $this->dbname"))) $this->Quit();
+
+    echo "MDB file: <b>$this->mdbfile</b> - DB name: <b>$this->dbname</b>".NL;
+    echo "Total tables: <b>$this->total_tables</b>".NL.NL;
+
+    // Step 2: Create tables
+    for ($t = 0; $t < $this->total_tables; $t++) {
+      $table = $this->tables[$t]; $flds = $this->total_fields[$t]; $recs = $this->total_recs[$t];
+      echo "Creating table #".($t+1).", <b>$table</b> . . .".NL;
+      $s1 = ($flds == 1) ? "" : "s"; $s2 = ($recs == 1) ? "" : "s";
+      if (!($res = $this->query("DROP TABLE IF EXISTS `$table`"))) $this->Quit();
+      $sql = "CREATE TABLE `$table` (";
+      for ($f = 0; $f < $flds; $f++) {
+        $fn = $this->field_names[$t][$f]; $ft = $this->field_DB_type_names[$t][$f];
+        $fl = $this->field_lens[$t][$f];
+        switch($ft) {
+        case "COUNTER": $sql .= $fn." INT(".$fl.") AUTO_INCREMENT PRIMARY KEY"; break; // Automatic indexing
+        case "CURRENCY": $sql .= $fn." DECIMAL(19,4)"; break;
+        case "DATETIME": case "LONGTEXT": case "LONGBLOB": case "TIMESTAMP":
+          $sql .= $fn." ".$ft; break; // No lengths!
+        case "REAL": $sql .= $fn." ".$ft."(".$fl.",4)"; break; // Add decimals
+        default: $sql .= $fn." ".$ft."(".$fl.")"; break;
+        }
+
+        if ($f < $flds-1) $sql .= ",\n"; else $sql .= ")\n";
+      }
+      if (!($res = $this->query($sql))) $this->Quit();
+    }
+
+    // Step 3: Add records to each table
+
+    for ($t = 0; $t < $this->total_tables; $t++) {
+      $table = $this->tables[$t]; $flds = $this->total_fields[$t]; $recs = $this->total_recs[$t];
+      // Delete any existing records to add all from start
+      if (!($res = $this->query("SELECT * FROM `$table`"))) $this->Quit();
+      $n = mysqli_num_rows($res);
+      if ($n != 0) {
+        if (!($res = $this->query("DELETE FROM `$table`"))) $this->Quit();
+        echo "$n record(s) from previous DB creation for table #".($t+1).", <b>$table</b> are deleted".NL;
+      }
+      echo "Adding $recs recs to table #".($t+1).", <b>$table</b> . . .".NL;
+      for ($r = 0; $r < $recs; $r++) {
+        $s = ""; for ($f = 0; $f < $flds; $f++) $s .= ", ".$this->field_names[$t][$f];
+        $s = "(".substr($s,2).")";
+        $sql = "INSERT INTO `$table` $s VALUES\n"; // Send a new query for each record
+        $s = "(";
+        for ($f = 0; $f < $flds; $f++) {
+          if ($this->field_DB_type_names[$t][$f] != "LONGBLOB") {
+            $rec = $this->ftrecs[$t][$f][$r];
+            // Check for not allowed chars contained in the rec - Add any other "illegal" chars found
+            $a = 0; $n = 0;
+            while (true) {
+              $a = strpos($rec,"'",$a); if ($a === false) break;
+              $rec = substr($rec,0,$a)."\\".substr($rec,$a); $a+=2;
+              ++$n; if ($n == 10) break; // Avoid endless loop!
+            }
+          } else $rec = "(bin)"; // Avoid writing binary data
+          $s .= "'".$rec."'"; if ($f < $flds-1) $s .= ", "; else $s .= ")\n";
+        }
+        $sql .= $s.";"; if (!($res = $this->query($sql))) $this->Quit();
+    } }
+
+    mysqli_close($this->db); $res = null;
+  }
+
+  // Returns a pathnname after adding default file extension if missing
+  function set_file($pathfile, $filext) {
+    // Normalize the pathfile, i.e. use a format that cna be accepted by all OS
+    $pathfile = str_replace("\\", "/", $pathfile);
+    $a = strrpos($pathfile, "/"); if ($a == false) $a = 0;
+    $a = strpos($pathfile, ".", $a); if ($a == false) $pathfile .= $filext;
+    return $pathfile;
+   }
+
+  function query($sql) {
+    $res = mysqli_query($this->db, $sql);
+    if (!$res) $this->errmess = "Failed to execute '".$this->maxstr($sql, 200)."'";
+    return $res;
+  }
+
+  // Return the DB type name based on type name '$name'
+  function GetDBname($name) {
+    global $db_types;
+    $s = $name; $a = strpos($s, "("); if ($a != false) $s = substr($s, 0, $a);
+    $s = array_search($s, $this->db_types);
+    if ($s === false) {echo "Cannot correspond type '$name' - VARCHAR will be used"._NL; $s = "VARCHAR";}
+    return $s;
+  }
+
+  // Return a string cut at given max length
+  function maxstr($str, $maxlen) {
+    if (strlen($str) <= $maxlen) return $str; else return substr($str, 0, ($maxlen-3))."...";
+  }
+
+  function Quit() {
+    @mysqli_close($this->db);
+    if ($this->errmess != "") echo $this->errmess.NL;
+    exit;
+  }
+
+}
+
+?>
